@@ -1,0 +1,48 @@
+# ─── Cloned / external framework (not part of this repo) ───
+QA_Automation_Banorte/
+
+# ─── Python ─────────────────────────────────────────────────
+backend/venv/
+backend/.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+*.so
+
+# ─── Environment / secrets ──────────────────────────────────
+backend/.env
+.env
+.env.local
+.env.*.local
+
+# ─── Node / frontend ────────────────────────────────────────
+frontend/node_modules/
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# ─── Playwright / test artifacts ────────────────────────────
+test-results/
+playwright-report/
+allure-results/
+allure-report/
+blob-report/
+
+# ─── OS / editor ────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace
+
+# ─── Misc ───────────────────────────────────────────────────
+nul
+*.log
+*.tmp
