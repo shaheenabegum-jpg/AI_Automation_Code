@@ -34,11 +34,11 @@ from config import settings
 from database import get_db, init_db, AsyncSessionLocal
 from models import (
     Project, TestCase, GeneratedScript, ExecutionRun, UserPrompt,
-    ValidationStatus, ExecutionStatus, MCPBrowserSession, MCPSessionStatus,
+    ValidationStatus, ExecutionStatus, DomSnapshot,
 )
 from excel_parser import parse_excel, test_case_to_json
 from framework_loader import get_framework_context, invalidate_cache
-from llm_orchestrator import stream_script, active_provider_info
+from llm_orchestrator import stream_script, active_provider_info, stream_fix_script
 from script_validator import validate_with_self_correction
 from execution_engine import run_test, save_script_to_framework, run_test_locally
 from github_actions_runner import (
@@ -159,12 +159,190 @@ async def get_llm_provider():
     return active_provider_info()
 
 
+@app.post("/api/crawl-page")
+async def crawl_page_endpoint(
+    url: str = Form(...),
+    project_id: str = Form(default=""),
+    db: AsyncSession = Depends(get_db),
+):
+    """Crawl a URL (with optional auto-login from project creds), save snapshot to DB."""
+    import hashlib as _hl
+    from dom_crawler import crawl_page
+    from dom_chunker import build_dom_context
+
+    # Load project credentials for auto-login
+    auth = None
+    if project_id.strip():
+        try:
+            proj = await db.get(Project, uuid.UUID(project_id))
+            if proj and (proj.pw_email or proj.pw_testuser):
+                auth = {
+                    "pw_host": proj.pw_host or "",
+                    "pw_email": proj.pw_email or "",
+                    "pw_password": proj.pw_password or "",
+                    "pw_testuser": proj.pw_testuser or "",
+                }
+                logger.info("Crawl with auth for project %s", proj.name)
+        except Exception as e:
+            logger.warning("Failed to load project creds for crawl: %s", e)
+
+    result = await crawl_page(url.strip(), auth=auth)
+    if result.get("error"):
+        raise HTTPException(502, result["error"])
+
+    # Build chunked DOM context
+    dom_ctx = build_dom_context(result)
+
+    # Save to PostgreSQL
+    snapshot_id = None
+    try:
+        async with AsyncSessionLocal() as db:
+            snapshot = DomSnapshot(
+                project_id=uuid.UUID(project_id) if project_id.strip() else None,
+                url=result.get("url", url.strip()),
+                url_hash=_hl.sha256(url.strip().encode()).hexdigest(),
+                title=result.get("title", ""),
+                element_count=result.get("element_count", 0),
+                elements=result.get("elements", []),
+                accessibility_tree=result.get("accessibility_tree", ""),
+                screenshot_b64=result.get("screenshot_b64", ""),
+                dom_context=dom_ctx,
+            )
+            db.add(snapshot)
+            await db.commit()
+            snapshot_id = str(snapshot.id)
+            logger.info("Saved DOM snapshot %s for %s", snapshot_id, url.strip())
+    except Exception as e:
+        logger.warning("Failed to save DOM snapshot: %s", e)
+
+    return {
+        "snapshot_id": snapshot_id,
+        "url": result.get("url", ""),
+        "title": result.get("title", ""),
+        "screenshot_b64": result.get("screenshot_b64", ""),
+        "element_count": result.get("element_count", 0),
+        "elements_preview": result.get("elements", [])[:20],
+        "login_status": result.get("login_status"),
+    }
+
+
+@app.get("/api/dom-snapshots")
+async def list_dom_snapshots(
+    project_id: str = "",
+    url: str = "",
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    """List DOM snapshots — lightweight (no screenshot/elements in list view)."""
+    q = select(DomSnapshot).order_by(desc(DomSnapshot.created_at)).limit(limit)
+    if project_id.strip():
+        q = q.where(DomSnapshot.project_id == uuid.UUID(project_id))
+    if url.strip():
+        import hashlib as _hl
+        q = q.where(DomSnapshot.url_hash == _hl.sha256(url.strip().encode()).hexdigest())
+    rows = (await db.execute(q)).scalars().all()
+    return [
+        {
+            "id": str(s.id),
+            "project_id": str(s.project_id) if s.project_id else None,
+            "url": s.url,
+            "title": s.title,
+            "element_count": s.element_count,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+        }
+        for s in rows
+    ]
+
+
+@app.get("/api/dom-snapshots/{snapshot_id}")
+async def get_dom_snapshot(snapshot_id: str, db: AsyncSession = Depends(get_db)):
+    """Get full DOM snapshot detail including elements + screenshot."""
+    try:
+        sid = uuid.UUID(snapshot_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid snapshot_id")
+    s = await db.get(DomSnapshot, sid)
+    if not s:
+        raise HTTPException(404, "Snapshot not found")
+    return {
+        "id": str(s.id),
+        "project_id": str(s.project_id) if s.project_id else None,
+        "url": s.url,
+        "title": s.title,
+        "element_count": s.element_count,
+        "elements": s.elements or [],
+        "accessibility_tree": s.accessibility_tree or "",
+        "screenshot_b64": s.screenshot_b64 or "",
+        "dom_context": s.dom_context or "",
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+    }
+
+
+@app.get("/api/dom-snapshots/{snapshot_id}/compare/{other_id}")
+async def compare_dom_snapshots(
+    snapshot_id: str, other_id: str, db: AsyncSession = Depends(get_db),
+):
+    """Compare two DOM snapshots — shows added/removed elements."""
+    try:
+        sid_a = uuid.UUID(snapshot_id)
+        sid_b = uuid.UUID(other_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid snapshot ID")
+
+    snap_a = await db.get(DomSnapshot, sid_a)
+    snap_b = await db.get(DomSnapshot, sid_b)
+    if not snap_a or not snap_b:
+        raise HTTPException(404, "One or both snapshots not found")
+
+    # Build selector sets for comparison
+    def _selectors(snap):
+        return {
+            el.get("selector", ""): el
+            for el in (snap.elements or [])
+            if el.get("selector")
+        }
+
+    sels_a = _selectors(snap_a)
+    sels_b = _selectors(snap_b)
+
+    added_keys = set(sels_b.keys()) - set(sels_a.keys())
+    removed_keys = set(sels_a.keys()) - set(sels_b.keys())
+    common_keys = set(sels_a.keys()) & set(sels_b.keys())
+
+    # Detect text changes in common elements
+    changed = []
+    for k in common_keys:
+        if sels_a[k].get("text") != sels_b[k].get("text"):
+            changed.append({
+                "selector": k,
+                "old_text": sels_a[k].get("text", ""),
+                "new_text": sels_b[k].get("text", ""),
+            })
+
+    return {
+        "snapshot_a": {"id": str(snap_a.id), "url": snap_a.url, "title": snap_a.title, "created_at": snap_a.created_at.isoformat()},
+        "snapshot_b": {"id": str(snap_b.id), "url": snap_b.url, "title": snap_b.title, "created_at": snap_b.created_at.isoformat()},
+        "added_elements": [sels_b[k] for k in added_keys],
+        "removed_elements": [sels_a[k] for k in removed_keys],
+        "changed_elements": changed,
+        "summary": {
+            "added": len(added_keys),
+            "removed": len(removed_keys),
+            "changed": len(changed),
+            "unchanged": len(common_keys) - len(changed),
+            "total_a": snap_a.element_count,
+            "total_b": snap_b.element_count,
+        },
+    }
+
+
 @app.post("/api/generate-script")
 async def generate_script_endpoint(
     test_case_id: str = Form(...),
     user_instruction: str = Form(default=""),
     llm_provider: str = Form(default=""),   # "anthropic" | "gemini" | "" (use .env default)
     project_id: str = Form(default=""),
+    page_url: str = Form(default=""),        # optional: URL to crawl for DOM context
     db: AsyncSession = Depends(get_db),
 ):
     tc = await db.get(TestCase, uuid.UUID(test_case_id))
@@ -179,6 +357,19 @@ async def generate_script_endpoint(
         proj_cfg = await get_project_config(project_id, db)
 
     ctx, ctx_hash = get_framework_context()
+
+    # DOM context — crawl the page if a URL was provided
+    _dom_ctx = ""
+    if page_url.strip():
+        try:
+            from dom_crawler import crawl_page
+            from dom_chunker import build_dom_context
+            crawl_result = await crawl_page(page_url.strip())
+            if not crawl_result.get("error"):
+                _dom_ctx = build_dom_context(crawl_result, tc.parsed_json if tc else None)
+                logger.info("DOM context: %d chars from %s", len(_dom_ctx), page_url.strip())
+        except Exception as e:
+            logger.warning("DOM crawl failed (continuing without): %s", e)
 
     # Resolve provider: form param → env default
     provider = llm_provider.strip().lower() or None  # None → orchestrator uses LLM_PROVIDER
@@ -203,6 +394,7 @@ async def generate_script_endpoint(
     tc_parsed_json   = tc.parsed_json
     tc_script_num    = tc.test_script_num
     tc_module        = tc.module
+    dom_ctx          = _dom_ctx
 
     async def event_stream():
         # Send script_id first so the frontend can poll status
@@ -212,17 +404,32 @@ async def generate_script_endpoint(
         try:
             # Stream chunks from the chosen LLM provider
             async for chunk in stream_script(
-                tc_parsed_json, user_instruction, ctx, provider
+                tc_parsed_json, user_instruction, ctx, provider, dom_context=dom_ctx
             ):
                 full_script += chunk
                 yield f"data: {json.dumps({'type': 'chunk', 'text': chunk})}\n\n"
 
+            # Safety net 0 — strip markdown fences & multi-file headers
+            full_script = _strip_markdown_fences(full_script)
             # Safety net 1 — correct ../ → ../../ for scripts in tests/generated/
             full_script = _fix_import_paths(full_script)
             # Safety net 2 — convert named imports to default imports for page/custom classes
             full_script = _fix_page_import_style(full_script)
             # Safety net 3 — auto-add imports for any page class used but not imported
             full_script = _ensure_imports_match_usage(full_script)
+
+            # POM extraction — detect page class markers and save separately
+            page_class_path = None
+            pom_dir = proj_cfg["playwright_project_path"] if proj_cfg and proj_cfg.get("playwright_project_path") else settings.PLAYWRIGHT_PROJECT_PATH
+            full_script, page_class_path = _extract_and_save_page_class(full_script, pom_dir)
+            if page_class_path:
+                yield f"data: {json.dumps({'type': 'status', 'message': f'Extracted page class → {page_class_path}'})}\n\n"
+                try:
+                    page_content = (Path(pom_dir) / page_class_path).read_text(encoding="utf-8")
+                    await commit_spec_to_ai_branch(Path(page_class_path).name, page_content)
+                    yield f"data: {json.dumps({'type': 'status', 'message': f'Committed {page_class_path} to GitHub'})}\n\n"
+                except Exception as pom_err:
+                    logger.warning("Failed to commit page class: %s", pom_err)
 
             # Validate
             yield f"data: {json.dumps({'type': 'status', 'message': 'Validating TypeScript…'})}\n\n"
@@ -304,6 +511,36 @@ _AUTO_IMPORT_MAP: dict[str, str] = {
 }
 
 
+def _strip_markdown_fences(code: str) -> str:
+    """
+    Safety net 0: strip markdown code fences and multi-file headers.
+    LLM sometimes wraps output in ```typescript ... ``` or adds **File 1:** headers.
+    This extracts the last (or largest) TypeScript code block, which is the .spec.ts.
+    """
+    import re
+    # If the code has markdown fences, extract the code blocks
+    blocks = re.findall(r'```(?:typescript|ts)?\s*\n(.*?)```', code, re.DOTALL)
+    if blocks:
+        # Pick the last block — usually the .spec.ts (page classes come first)
+        # But prefer the block that contains 'test(' if there are multiple
+        spec_block = None
+        for b in blocks:
+            if "test(" in b or "test.describe(" in b:
+                spec_block = b
+        code = spec_block.strip() if spec_block else blocks[-1].strip()
+    else:
+        # No fences — strip any preamble text before the first import
+        lines = code.split('\n')
+        start = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith('import '):
+                start = i
+                break
+        if start > 0:
+            code = '\n'.join(lines[start:])
+    return code.strip()
+
+
 def _fix_import_paths(code: str) -> str:
     """
     Safety net 1: correct one-level-up paths to two-level-up.
@@ -381,6 +618,246 @@ def _ensure_imports_match_usage(code: str) -> str:
 async def _validate(code: str) -> tuple[bool, str]:
     from script_validator import validate_typescript
     return await validate_typescript(code)
+
+
+def _extract_error_from_logs(log_lines: list[str]) -> str:
+    """Extract meaningful error text from Playwright test output logs."""
+    import re as _re
+    error_patterns = [
+        r'Error:', r'error:', r'expect\(', r'toBeVisible', r'toHaveText',
+        r'timeout', r'Timeout', r'assert', r'FAILED', r'waiting for',
+        r'locator\.', r'page\.', r'at /', r'at C:', r'› ',
+        r'browserType\.launch', r'net::ERR',
+    ]
+    combined_pattern = '|'.join(error_patterns)
+    filtered = []
+    for line in log_lines:
+        if line in ('__DONE__', '') or line.startswith('─' * 5):
+            continue
+        clean = _re.sub(r'\x1b\[[0-9;]*m', '', line)  # strip ANSI
+        if _re.search(combined_pattern, clean):
+            filtered.append(clean.strip())
+    result = '\n'.join(filtered)
+    return result[:2000] if len(result) > 2000 else result
+
+
+def _extract_and_save_page_class(
+    full_script: str, project_dir: str
+) -> tuple[str, str | None]:
+    """
+    Detect POM marker in LLM output. If found, extract page class and save it.
+    Returns (spec_code, page_class_path) or (full_script, None) if no marker.
+    """
+    import re as _re
+    marker_match = _re.search(
+        r'//\s*===\s*PAGE_CLASS:\s*(\w+)\.ts\s*===', full_script
+    )
+    if not marker_match:
+        return full_script, None
+
+    class_name = marker_match.group(1)
+    logger.info("POM detected: %s.ts", class_name)
+
+    # Split on SPEC_FILE marker
+    spec_marker = _re.search(r'//\s*===\s*SPEC_FILE\s*===', full_script)
+    if not spec_marker:
+        logger.warning("PAGE_CLASS marker found but no SPEC_FILE marker — returning as single file")
+        return full_script, None
+
+    page_class_code = full_script[marker_match.end():spec_marker.start()].strip()
+    spec_code = full_script[spec_marker.end():].strip()
+
+    if not page_class_code or not spec_code:
+        logger.warning("POM extraction yielded empty code — returning as single file")
+        return full_script, None
+
+    # Save page class file
+    pages_dir = Path(project_dir) / "pages"
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    page_file = pages_dir / f"{class_name}.ts"
+    page_file.write_text(page_class_code, encoding="utf-8")
+    logger.info("Saved page class: %s", page_file)
+
+    return spec_code, f"pages/{class_name}.ts"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 2b. FIX FAILED SCRIPT (Self-Healing)
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/fix-script")
+async def fix_script_endpoint(
+    run_id: str = Form(...),
+    llm_provider: str = Form(default=""),
+    project_id: str = Form(default=""),
+    db: AsyncSession = Depends(get_db),
+):
+    """SSE stream: auto-fix a failed test script using LLM error analysis."""
+    import redis.asyncio as aioredis
+    import traceback as _tb
+
+    try:
+        return await _fix_script_inner(run_id, llm_provider, project_id, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("fix-script error: %s\n%s", repr(e), _tb.format_exc())
+        raise HTTPException(500, f"Fix endpoint error: {repr(e)}")
+
+
+async def _fix_script_inner(run_id, llm_provider, project_id, db):
+    import redis.asyncio as aioredis
+
+    # 1. Fetch the failed run
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid run_id format")
+    run = await db.get(ExecutionRun, run_uuid)
+    if not run:
+        raise HTTPException(404, "Run not found")
+    run_status_str = run.status.value if hasattr(run.status, 'value') else str(run.status)
+    if run_status_str not in ("failed", "error"):
+        raise HTTPException(400, f"Run status is '{run_status_str}', not 'failed'")
+
+    # 2. Get original script code
+    original_code = ""
+    if run.script_id:
+        script = await db.get(GeneratedScript, run.script_id)
+        if script:
+            original_code = script.typescript_code or ""
+    if not original_code and run.spec_file_path:
+        # Try reading from disk
+        for base in [settings.PLAYWRIGHT_PROJECT_PATH, settings.MGA_PLAYWRIGHT_PROJECT_PATH]:
+            if not base:
+                continue
+            spec_path = Path(base) / run.spec_file_path
+            alt_path = Path(base) / run.spec_file_path.removeprefix("skye-e2e-tests/")
+            for p in [spec_path, alt_path]:
+                if p.exists():
+                    original_code = p.read_text(encoding="utf-8")
+                    break
+            if original_code:
+                break
+    if not original_code:
+        raise HTTPException(400, "Could not find original script code for this run")
+
+    # 3. Fetch error logs from Redis
+    r = aioredis.from_url(settings.REDIS_URL)
+    history_key = f"run:{run_id}:log_history"
+    try:
+        raw_lines = await r.lrange(history_key, 0, -1)
+        log_lines = [line.decode() if isinstance(line, bytes) else line for line in raw_lines]
+    except Exception:
+        log_lines = []
+    finally:
+        await r.aclose()
+
+    error_text = _extract_error_from_logs(log_lines)
+    if not error_text:
+        error_text = f"Test failed with exit code {run.exit_code or 1}. No detailed error captured."
+
+    # 4. Framework context
+    ctx, ctx_hash = get_framework_context()
+    provider = llm_provider.strip().lower() or None
+
+    # 5. Pre-create new script record
+    pid = uuid.UUID(project_id) if project_id.strip() else run.project_id
+    tc_id = None
+    if run.script_id:
+        orig_script = await db.get(GeneratedScript, run.script_id)
+        if orig_script:
+            tc_id = orig_script.test_case_id
+    if not tc_id:
+        # Fallback: find any test case in the project (or the first one)
+        from sqlalchemy import select as _sel
+        tc_query = _sel(TestCase.id)
+        if pid:
+            tc_query = tc_query.where(TestCase.project_id == pid)
+        tc_query = tc_query.limit(1)
+        tc_row = (await db.execute(tc_query)).scalar_one_or_none()
+        tc_id = tc_row or None
+    if not tc_id:
+        raise HTTPException(400, "No test cases found to associate with the fix. Upload an Excel file first.")
+    fix_record = GeneratedScript(
+        test_case_id=tc_id,
+        project_id=pid,
+        typescript_code="",
+        framework_version=ctx_hash[:8],
+        validation_status=ValidationStatus.pending,
+    )
+    db.add(fix_record)
+    await db.flush()
+    fix_id = str(fix_record.id)
+    fix_record_id = fix_record.id
+    await db.commit()
+
+    # Snapshot for closure
+    _original_code = original_code
+    _error_text = error_text
+    _ctx = ctx
+    _ctx_hash = ctx_hash
+
+    async def event_stream():
+        yield f"data: {json.dumps({'type': 'script_id', 'script_id': fix_id})}\n\n"
+        yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing error and generating fix…'})}\n\n"
+
+        full_script = ""
+        try:
+            async for chunk in stream_fix_script(
+                _original_code, _error_text, _ctx, provider
+            ):
+                full_script += chunk
+                yield f"data: {json.dumps({'type': 'chunk', 'text': chunk})}\n\n"
+
+            # Safety nets
+            full_script = _strip_markdown_fences(full_script)
+            full_script = _fix_import_paths(full_script)
+            full_script = _fix_page_import_style(full_script)
+            full_script = _ensure_imports_match_usage(full_script)
+
+            # Validate
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Validating fixed script…'})}\n\n"
+            is_valid, errors = await _validate(full_script)
+
+            # Save to framework + GitHub
+            file_rel_path = ""
+            try:
+                from execution_engine import save_script_to_framework
+                file_rel_path = await save_script_to_framework(
+                    full_script, f"FIX_{run_id[:8]}", "auto_fix"
+                )
+            except Exception as e:
+                logger.warning("Failed to save fix to framework: %s", e)
+
+            try:
+                from github_actions_runner import commit_spec_to_ai_branch
+                spec_filename = Path(file_rel_path).name if file_rel_path else f"FIX_{run_id[:8]}.spec.ts"
+                await commit_spec_to_ai_branch(spec_filename, full_script)
+            except Exception as e:
+                logger.warning("Failed to commit fix to GitHub: %s", e)
+
+            # Persist to DB
+            usage = getattr(stream_fix_script, "last_usage", {})
+            async with AsyncSessionLocal() as save_db:
+                rec = await save_db.get(GeneratedScript, fix_record_id)
+                if rec:
+                    rec.typescript_code = full_script
+                    rec.file_path = file_rel_path
+                    rec.validation_status = (
+                        ValidationStatus.valid if is_valid else ValidationStatus.invalid
+                    )
+                    rec.validation_errors = errors if not is_valid else None
+                    await save_db.commit()
+
+            model_used = usage.get("model", settings.ANTHROPIC_MODEL)
+            yield f"data: {json.dumps({'type': 'done', 'script_id': fix_id, 'valid': is_valid, 'errors': errors, 'file_path': file_rel_path, 'provider': usage.get('provider', 'anthropic')})}\n\n"
+
+        except Exception as e:
+            logger.error("Fix script error: %s", e)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1178,336 +1655,6 @@ async def delete_project(project_id: str, db: AsyncSession = Depends(get_db)):
     p.is_active = False
     await db.commit()
     return {"deleted": project_id, "name": p.name}
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# 10. MCP BROWSER — AI Browser exploration endpoints
-# ════════════════════════════════════════════════════════════════════════════════
-
-from mcp_manager import mcp_session_manager
-from mcp_orchestrator import auto_explore, generate_script_from_steps
-from datetime import datetime as _dt
-
-
-@app.post("/api/mcp/start-session")
-async def mcp_start_session(body: dict = Body(...), db: AsyncSession = Depends(get_db)):
-    """Start a new MCP browser session."""
-    url = body.get("url", "")
-    browser = body.get("browser", "chromium")
-    headless = body.get("headless", True)
-    project_id = body.get("project_id")
-    test_case_id = body.get("test_case_id")
-
-    if not url:
-        raise HTTPException(400, "url is required")
-
-    try:
-        session = mcp_session_manager.create_session(
-            browser=browser,
-            headless=headless,
-            project_id=project_id,
-        )
-        session.start_url = url
-    except RuntimeError as e:
-        raise HTTPException(429, str(e))
-    except Exception as e:
-        raise HTTPException(500, f"Failed to start MCP session: {e}")
-
-    # Save to DB
-    db_session = MCPBrowserSession(
-        id=uuid.UUID(session.session_id),
-        project_id=uuid.UUID(project_id) if project_id else None,
-        test_case_id=uuid.UUID(test_case_id) if test_case_id else None,
-        start_url=url,
-        browser=browser,
-        headless=headless,
-        status=MCPSessionStatus.active,
-    )
-    db.add(db_session)
-    await db.commit()
-
-    return {
-        "session_id": session.session_id,
-        "status": "active",
-        "browser": browser,
-        "headless": headless,
-        "url": url,
-    }
-
-
-@app.post("/api/mcp/action")
-async def mcp_manual_action(body: dict = Body(...)):
-    """Execute a single manual action on an MCP session."""
-    session_id = body.get("session_id", "")
-    action = body.get("action", "")
-
-    session = mcp_session_manager.get_session(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-
-    try:
-        if action == "navigate":
-            result = session.navigate(body.get("url", ""))
-        elif action == "click":
-            result = session.click(body.get("element", ""), body.get("ref", ""))
-        elif action == "fill":
-            result = session.fill(body.get("element", ""), body.get("value", ""), body.get("ref", ""))
-        elif action == "select":
-            result = session.select_option(body.get("element", ""), [body.get("value", "")], body.get("ref", ""))
-        elif action == "hover":
-            result = session.hover(body.get("element", ""), body.get("ref", ""))
-        elif action == "screenshot":
-            b64 = session.screenshot()
-            return {"screenshot": b64}
-        elif action == "snapshot":
-            text = session.snapshot()
-            return {"snapshot": text}
-        elif action == "press_key":
-            result = session.press_key(body.get("key", "Enter"))
-        elif action == "wait":
-            result = session.wait(int(body.get("time_ms", 2000)))
-        elif action == "go_back":
-            result = session.go_back()
-        else:
-            raise HTTPException(400, f"Unknown action: {action}")
-
-        # Also take a screenshot after the action
-        try:
-            screenshot = session.screenshot()
-        except Exception:
-            screenshot = ""
-
-        return {"result": "ok", "action": action, "screenshot": screenshot}
-
-    except TimeoutError as e:
-        raise HTTPException(504, str(e))
-    except Exception as e:
-        raise HTTPException(500, f"Action failed: {e}")
-
-
-@app.post("/api/mcp/auto-explore")
-async def mcp_auto_explore(body: dict = Body(...)):
-    """SSE endpoint: AI explores the app autonomously based on test case description."""
-    session_id = body.get("session_id", "")
-    test_case_description = body.get("test_case_description", "")
-    url = body.get("url", "")
-    llm_provider = body.get("llm_provider", "")
-    project_id = body.get("project_id", "")
-
-    session = mcp_session_manager.get_session(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-
-    if not test_case_description:
-        raise HTTPException(400, "test_case_description is required")
-
-    provider = llm_provider if llm_provider else None
-
-    import redis.asyncio as aioredis
-    r = aioredis.from_url(settings.REDIS_URL)
-    channel = f"mcp:{session_id}:events"
-    history_key = f"mcp:{session_id}:event_history"
-
-    async def event_stream():
-        try:
-            async for event in auto_explore(
-                session=session,
-                test_case_description=test_case_description,
-                start_url=url or session.start_url,
-                provider=provider,
-            ):
-                # Publish to Redis for WebSocket clients
-                event_json = json.dumps(event, default=str)
-                await r.publish(channel, event_json)
-                await r.rpush(history_key, event_json)
-                await r.expire(history_key, 86400)
-
-                # Also send as SSE
-                yield f"data: {event_json}\n\n"
-
-            # Signal done
-            done_event = json.dumps({"type": "done", "total_steps": len(session.steps)})
-            await r.publish(channel, done_event)
-            await r.rpush(history_key, done_event)
-
-        except Exception as e:
-            error_event = json.dumps({"type": "error", "message": str(e)})
-            yield f"data: {error_event}\n\n"
-        finally:
-            await r.aclose()
-
-            # Update DB
-            try:
-                async with AsyncSessionLocal() as save_db:
-                    db_session = await save_db.get(MCPBrowserSession, uuid.UUID(session_id))
-                    if db_session:
-                        db_session.steps = [s.to_dict() for s in session.steps]
-                        db_session.total_steps = len(session.steps)
-                        await save_db.commit()
-            except Exception as e:
-                logger.warning("Failed to save MCP session steps: %s", e)
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-@app.post("/api/mcp/pause")
-async def mcp_pause(body: dict = Body(...)):
-    """Pause an MCP exploration."""
-    session_id = body.get("session_id", "")
-    session = mcp_session_manager.get_session(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-    session.pause_event.clear()
-    session.status = "paused"
-    return {"session_id": session_id, "status": "paused"}
-
-
-@app.post("/api/mcp/resume")
-async def mcp_resume(body: dict = Body(...)):
-    """Resume a paused MCP exploration."""
-    session_id = body.get("session_id", "")
-    session = mcp_session_manager.get_session(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-    session.pause_event.set()
-    session.status = "active"
-    return {"session_id": session_id, "status": "active"}
-
-
-@app.post("/api/mcp/generate-script")
-async def mcp_generate_script_endpoint(body: dict = Body(...)):
-    """SSE endpoint: Generate a Playwright script from MCP exploration steps."""
-    session_id = body.get("session_id", "")
-    test_case_description = body.get("test_case_description", "")
-    llm_provider = body.get("llm_provider", "")
-    project_id = body.get("project_id", "")
-
-    session = mcp_session_manager.get_session(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-
-    if not session.steps:
-        raise HTTPException(400, "No exploration steps recorded. Run auto-explore first.")
-
-    provider = llm_provider if llm_provider else None
-
-    async def event_stream():
-        full_code = ""
-        try:
-            async for chunk in generate_script_from_steps(
-                session=session,
-                test_case_description=test_case_description or "MCP browser exploration test",
-                provider=provider,
-                project_id=project_id,
-            ):
-                full_code += chunk
-                yield f"data: {json.dumps({'type': 'chunk', 'text': chunk})}\n\n"
-
-            # Validate the generated script
-            is_valid = True
-            errors = ""
-            try:
-                from script_validator import validate_typescript
-                is_valid, errors = await validate_typescript(full_code)
-            except Exception as e:
-                logger.warning("Validation skipped: %s", e)
-
-            # Save to DB
-            script_id = str(uuid.uuid4())
-            try:
-                async with AsyncSessionLocal() as save_db:
-                    script = GeneratedScript(
-                        id=uuid.UUID(script_id),
-                        project_id=uuid.UUID(project_id) if project_id else None,
-                        test_case_id=uuid.uuid4(),  # placeholder — MCP doesn't have a test_case row
-                        typescript_code=full_code,
-                        validation_status=ValidationStatus.valid if is_valid else ValidationStatus.invalid,
-                        validation_errors=errors if errors else None,
-                    )
-                    save_db.add(script)
-                    await save_db.commit()
-
-                    # Link script to MCP session
-                    mcp_row = await save_db.get(MCPBrowserSession, uuid.UUID(session_id))
-                    if mcp_row:
-                        mcp_row.generated_script_id = uuid.UUID(script_id)
-                        mcp_row.status = MCPSessionStatus.completed
-                        mcp_row.ended_at = _dt.utcnow()
-                        await save_db.commit()
-            except Exception as e:
-                logger.warning("Failed to save MCP generated script: %s", e)
-
-            yield f"data: {json.dumps({'type': 'done', 'script_id': script_id, 'valid': is_valid, 'errors': errors})}\n\n"
-
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-@app.post("/api/mcp/stop-session")
-async def mcp_stop_session(body: dict = Body(...), db: AsyncSession = Depends(get_db)):
-    """Stop an MCP session and cleanup."""
-    session_id = body.get("session_id", "")
-    session = mcp_session_manager.get_session(session_id)
-
-    if session:
-        # Save final state to DB
-        try:
-            db_session = await db.get(MCPBrowserSession, uuid.UUID(session_id))
-            if db_session:
-                db_session.steps = [s.to_dict() for s in session.steps]
-                db_session.total_steps = len(session.steps)
-                db_session.status = MCPSessionStatus.completed
-                db_session.ended_at = _dt.utcnow()
-                await db.commit()
-        except Exception:
-            pass
-        mcp_session_manager.destroy_session(session_id)
-
-    return {"session_id": session_id, "status": "stopped"}
-
-
-@app.get("/api/mcp/sessions")
-async def list_mcp_sessions(project_id: str = "", db: AsyncSession = Depends(get_db)):
-    """List MCP browser sessions."""
-    stmt = select(MCPBrowserSession).order_by(desc(MCPBrowserSession.created_at)).limit(50)
-    if project_id:
-        stmt = stmt.where(MCPBrowserSession.project_id == uuid.UUID(project_id))
-    rows = (await db.execute(stmt)).scalars().all()
-    return [
-        {
-            "id": str(s.id),
-            "project_id": str(s.project_id) if s.project_id else None,
-            "start_url": s.start_url,
-            "browser": s.browser,
-            "headless": s.headless,
-            "status": s.status.value if hasattr(s.status, 'value') else s.status,
-            "total_steps": s.total_steps,
-            "generated_script_id": str(s.generated_script_id) if s.generated_script_id else None,
-            "created_at": s.created_at.isoformat() if s.created_at else None,
-            "ended_at": s.ended_at.isoformat() if s.ended_at else None,
-        }
-        for s in rows
-    ]
-
-
-@app.websocket("/ws/mcp/{session_id}")
-async def websocket_mcp(session_id: str, ws: WebSocket):
-    """WebSocket for live MCP events."""
-    await ws_manager.connect(session_id, ws)
-    task = asyncio.create_task(
-        redis_json_subscriber(session_id, ws_manager, settings.REDIS_URL)
-    )
-    try:
-        while True:
-            # Keep connection alive, receive any client messages (ignored)
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        ws_manager.disconnect(session_id, ws)
-        task.cancel()
 
 
 # ════════════════════════════════════════════════════════════════════════════════

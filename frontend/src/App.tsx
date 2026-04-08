@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ConfigProvider, Layout, Tabs, theme, Spin } from 'antd';
 import {
   DashboardOutlined, RobotOutlined, PlaySquareOutlined, AppstoreOutlined,
-  CompassOutlined, SunOutlined, MoonOutlined,
+  SunOutlined, MoonOutlined,
 } from '@ant-design/icons';
 import { Toaster } from 'react-hot-toast';
 import { colors, gradients, getAntThemeTokens, getAntComponentTokens } from './theme';
@@ -14,7 +14,6 @@ import ProjectSelector from './components/ProjectSelector';
 const Dashboard   = lazy(() => import('./components/Dashboard'));
 const AIPhaseTab  = lazy(() => import('./components/AIPhaseTab'));
 const RunTab      = lazy(() => import('./components/RunTab'));
-const AIBrowserTab = lazy(() => import('./components/AIBrowserTab'));
 const ProjectsTab = lazy(() => import('./components/ProjectsTab'));
 
 const { Header, Content } = Layout;
@@ -148,22 +147,6 @@ function AppContent() {
                 children: (
                   <Suspense fallback={<Spin size="large" style={{ display: 'block', margin: '80px auto' }} />}>
                     <RunTab />
-                  </Suspense>
-                ),
-              },
-              {
-                key:   'ai-browser',
-                label: (
-                  <span className="tab-label tab-ai-browser">
-                    <span className="tab-icon-wrap tab-icon-browser">
-                      <CompassOutlined />
-                    </span>
-                    AI Browser
-                  </span>
-                ),
-                children: (
-                  <Suspense fallback={<Spin size="large" style={{ display: 'block', margin: '80px auto' }} />}>
-                    <AIBrowserTab />
                   </Suspense>
                 ),
               },

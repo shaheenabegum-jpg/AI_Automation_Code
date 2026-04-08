@@ -10,10 +10,11 @@ import {
   UploadOutlined, ThunderboltOutlined, CheckCircleOutlined,
   CloseCircleOutlined, ReloadOutlined, CopyOutlined,
   RobotOutlined, StopOutlined, CloudUploadOutlined,
+  GlobalOutlined, EyeOutlined,
 } from '@ant-design/icons';
 import Editor from '@monaco-editor/react';
 import toast from 'react-hot-toast';
-import { uploadExcel, createScriptStream, refreshFramework, fetchLLMProvider } from '../api/client';
+import { uploadExcel, createScriptStream, refreshFramework, fetchLLMProvider, crawlPage } from '../api/client';
 import { useProjectContext } from '../context/ProjectContext';
 import type { TestCase } from '../types';
 import { colors, gradients } from '../theme';
@@ -55,6 +56,14 @@ export default function AIPhaseTab() {
   const [provider, setProvider]         = useState<LLMProvider>('anthropic');
   const [providerInfo, setProviderInfo] = useState<ProviderInfo | null>(null);
 
+  // DOM Crawler state
+  const [pageUrl, setPageUrl]         = useState('');
+  const [crawling, setCrawling]       = useState(false);
+  const [crawlResult, setCrawlResult] = useState<{
+    title: string; screenshot_b64: string; element_count: number;
+    elements_preview: Array<{ tag: string; selector: string; text: string }>;
+  } | null>(null);
+
   useEffect(() => {
     fetchLLMProvider()
       .then((info: ProviderInfo) => {
@@ -79,6 +88,23 @@ export default function AIPhaseTab() {
     }
     return false;
   }, []);
+
+  const handleCrawl = useCallback(async () => {
+    if (!pageUrl.trim()) return;
+    setCrawling(true);
+    setCrawlResult(null);
+    try {
+      const data = await crawlPage(pageUrl.trim());
+      setCrawlResult(data);
+      toast.success(`Crawled: ${data.title || pageUrl} — ${data.element_count} elements found`);
+    } catch (err: unknown) {
+      const axiosErr = err as { response?: { data?: { detail?: string } }; message?: string };
+      const detail = axiosErr?.response?.data?.detail ?? axiosErr?.message ?? 'Crawl failed';
+      toast.error(detail);
+    } finally {
+      setCrawling(false);
+    }
+  }, [pageUrl]);
 
   const generateOne = useCallback(
     (tcId: string): Promise<BatchResult> => {
@@ -115,11 +141,12 @@ export default function AIPhaseTab() {
           },
           provider,
           selectedProjectId ?? '',
+          pageUrl.trim(),
         );
         stopCurrentRef.current = stop;
       });
     },
-    [testCases, instruction, provider, selectedProjectId],
+    [testCases, instruction, provider, selectedProjectId, pageUrl],
   );
 
   const handleGenerate = async () => {
@@ -308,14 +335,96 @@ export default function AIPhaseTab() {
           </Upload>
         </Card>
 
-        {/* 3. Test cases */}
+        {/* 3. Page URL (optional — for DOM context) */}
+        <Card
+          size="small"
+          className="glow-card section-card"
+          title={<Space><GlobalOutlined style={{ color: colors.cyan || '#22d3ee' }} /> <span>3. Page URL <Text style={{ color: colors.textMuted, fontSize: 11 }}>(optional — improves locator accuracy)</Text></span></Space>}
+          style={{ background: colors.bgCard, border: `1px solid ${colors.border}` }}
+        >
+          <Space.Compact style={{ width: '100%' }}>
+            <Input
+              placeholder="https://your-app.com/page-to-test"
+              value={pageUrl}
+              onChange={(e) => { setPageUrl(e.target.value); setCrawlResult(null); }}
+              onPressEnter={handleCrawl}
+              style={{ background: colors.bgSurface, borderColor: colors.border }}
+            />
+            <Button
+              icon={<EyeOutlined />}
+              loading={crawling}
+              disabled={!pageUrl.trim()}
+              onClick={handleCrawl}
+              style={{ borderColor: colors.border }}
+            >
+              Crawl
+            </Button>
+          </Space.Compact>
+
+          {crawlResult && (
+            <>
+              <div style={{
+                marginTop: 10, padding: 10, borderRadius: 8,
+                background: colors.bgSurface, border: `1px solid ${colors.border}`,
+                display: 'flex', gap: 12, alignItems: 'center',
+              }}>
+                {crawlResult.screenshot_b64 && (
+                  <img
+                    src={`data:image/jpeg;base64,${crawlResult.screenshot_b64}`}
+                    alt="Page preview"
+                    style={{ width: 160, height: 90, objectFit: 'cover', borderRadius: 6, border: `1px solid ${colors.border}` }}
+                  />
+                )}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ color: colors.textPrimary, fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {crawlResult.title || 'Untitled'}
+                  </div>
+                  <div style={{ color: colors.textMuted, fontSize: 11, marginTop: 2 }}>
+                    {pageUrl.length > 50 ? pageUrl.slice(0, 50) + '...' : pageUrl}
+                  </div>
+                  <Tag color="green" style={{ marginTop: 6 }}>
+                    {crawlResult.element_count} interactive elements
+                  </Tag>
+                </div>
+              </div>
+
+              {crawlResult.elements_preview && crawlResult.elements_preview.length > 0 && (
+                <details style={{ marginTop: 8 }}>
+                  <summary style={{
+                    cursor: 'pointer', color: colors.textSecondary, fontSize: 11,
+                    userSelect: 'none', padding: '4px 0',
+                  }}>
+                    Show {Math.min(crawlResult.elements_preview.length, 20)} elements
+                  </summary>
+                  <div style={{
+                    maxHeight: 200, overflowY: 'auto', marginTop: 6,
+                    background: colors.bgDeepest || colors.bgSurface,
+                    borderRadius: 6, padding: 8,
+                    border: `1px solid ${colors.border}`,
+                    fontFamily: 'monospace', fontSize: 11, lineHeight: 1.6,
+                  }}>
+                    {crawlResult.elements_preview.slice(0, 20).map((el: { tag: string; selector: string; text: string }, i: number) => (
+                      <div key={i} style={{ color: colors.textSecondary, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        <span style={{ color: '#22d3ee', fontWeight: 600 }}>{el.tag}</span>
+                        {el.selector && <span style={{ color: colors.textMuted }}> {el.selector.slice(0, 50)}</span>}
+                        {el.text && <span style={{ color: '#94a3b8' }}> &quot;{el.text.slice(0, 30)}&quot;</span>}
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
+            </>
+          )}
+        </Card>
+
+        {/* 4. Test cases */}
         {testCases.length > 0 && (
           <Card
             size="small"
             className="glow-card section-card"
             title={
               <Space>
-                <span>3. Select Test Cases</span>
+                <span>4. Select Test Cases</span>
                 {selectedTcIds.length > 0 && (
                   <Tag style={{ background: `${colors.primary}22`, color: colors.primaryLight, border: 'none', borderRadius: 4 }}>
                     {selectedTcIds.length} selected
@@ -347,7 +456,7 @@ export default function AIPhaseTab() {
         <Card
           size="small"
           className="glow-card section-card"
-          title={<span>4. Extra Instructions <Text style={{ color: colors.textMuted, fontSize: 11 }}>(optional)</Text></span>}
+          title={<span>5. Extra Instructions <Text style={{ color: colors.textMuted, fontSize: 11 }}>(optional)</Text></span>}
           style={{ background: colors.bgCard, border: `1px solid ${colors.border}` }}
         >
           <TextArea

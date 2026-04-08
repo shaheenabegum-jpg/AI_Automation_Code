@@ -39,10 +39,6 @@
   --version-color:    #818cf8;
   --terminal-header:  linear-gradient(135deg, #111827, #0f172a);
   --terminal-header-border: #1e293b;
-  --mcp-screenshot-border: #1e293b;
-  --mcp-screenshot-bg:     #0b1120;
-  --mcp-step-bg:           #111827;
-  --mcp-step-active-bg:    #14b8a612;
 }
 
 [data-theme="light"] {
@@ -80,10 +76,6 @@
   --version-color:    #6366f1;
   --terminal-header:  linear-gradient(135deg, #1e293b, #0f172a);
   --terminal-header-border: #334155;
-  --mcp-screenshot-border: #e2e8f0;
-  --mcp-screenshot-bg:     #f8fafc;
-  --mcp-step-bg:           #f8fafc;
-  --mcp-step-active-bg:    #14b8a60d;
 }
 
 /* ── Base ─────────────────────────────────────────────────────────────────── */
@@ -470,44 +462,3 @@ html, body, #root,
   color: #475569 !important;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
-   MCP Browser — AI Browser Tab styles
-   ══════════════════════════════════════════════════════════════════════════════ */
-.mcp-screenshot-container {
-  transition: border-color 0.3s ease, background-color 0.3s ease;
-}
-.mcp-screenshot-container:hover {
-  border-color: #14b8a633 !important;
-}
-
-.mcp-step-card {
-  transition: all 0.2s ease;
-}
-.mcp-step-card:hover {
-  border-color: #14b8a644 !important;
-  transform: translateX(2px);
-}
-.mcp-step-card.active {
-  border-color: #14b8a666 !important;
-  box-shadow: 0 0 8px rgba(20, 184, 166, 0.1);
-}
-
-@keyframes mcp-pulse {
-  0% { box-shadow: 0 0 0 0 rgba(20, 184, 166, 0.3); }
-  70% { box-shadow: 0 0 0 6px rgba(20, 184, 166, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(20, 184, 166, 0); }
-}
-
-.mcp-tree-viewer {
-  transition: border-color 0.3s ease;
-}
-.mcp-tree-viewer:hover {
-  border-color: #14b8a633 !important;
-}
-
-.mcp-url-bar {
-  transition: border-color 0.3s ease, background-color 0.3s ease;
-}
-.mcp-url-bar:hover {
-  border-color: #14b8a633 !important;
-}

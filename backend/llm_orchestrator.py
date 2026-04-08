@@ -172,10 +172,31 @@ CRITICAL RULES — never break these:
 
 9. ASSERTIONS — always use expect() from @playwright/test; never console.log as a check.
 
-10. OUTPUT — return ONLY the TypeScript file content.
-    No markdown code fences, no explanations, no comments outside the code.
+10. OUTPUT FORMAT:
+    a) SINGLE FILE (default): Return ONLY the .spec.ts content. No markdown fences.
+    b) PAGE CLASS MODE: When the user EXPLICITLY asks to create a NEW page object class,
+       output TWO sections with these EXACT markers:
+
+       // === PAGE_CLASS: ClassName.ts ===
+       <page class TypeScript code here>
+       // === SPEC_FILE ===
+       <spec file TypeScript code here>
+
+       Page class rules: export default class, accept Page in constructor,
+       import { Page, Locator } from '@playwright/test', extend BasePage if it exists.
+       Spec file rules: import the class via default import from '../../pages/ClassName'.
+
+    If the user does NOT ask for a page class, use mode (a) — single file only.
+    NEVER use markdown fences (```). NEVER output "File 1:" or "File 2:" headers.
 
 11. TYPE SAFETY — the file must pass `tsc --noEmit --skipLibCheck`.
+
+12. DOM CONTEXT — when a "LIVE PAGE DOM CONTEXT" section is provided in the user message,
+    you MUST prefer the real selectors listed there over invented selectors.
+    Use data-testid → page.getByTestId('...'), id → page.locator('#...'),
+    aria-label → page.getByLabel('...'), role → page.getByRole('...').
+    Never invent selectors when real DOM selectors are provided.
+    If the DOM shows selector='[data-testid="login-btn"]', use page.getByTestId('login-btn').
 """
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -276,7 +297,10 @@ test('MGA_002 - Validate Login with Valid Credentials', async ({ page, skye, mga
 # MESSAGE BUILDERS
 # ════════════════════════════════════════════════════════════════════════════════
 
-def _main_user_content(test_case_json: dict, user_instruction: str, framework_context: str) -> str:
+def _main_user_content(
+    test_case_json: dict, user_instruction: str, framework_context: str,
+    dom_context: str = "",
+) -> str:
     instr = user_instruction.strip()
     extra_block = ""
     if instr:
@@ -291,9 +315,17 @@ def _main_user_content(test_case_json: dict, user_instruction: str, framework_co
             f"IMPORTANT: The above extra instructions OVERRIDE the default behavior.\n"
             f"You MUST incorporate every requirement listed above into the generated test.\n"
         )
+    dom_block = ""
+    if dom_context.strip():
+        dom_block = (
+            f"\n\n{dom_context}\n\n"
+            f"IMPORTANT: Use the REAL selectors from the DOM context above.\n"
+            f"Prefer data-testid selectors (page.getByTestId) when available.\n"
+        )
     return (
         f"Framework context (existing Page Objects, fixtures, custom commands):\n"
         f"```typescript\n{framework_context}\n```\n\n"
+        f"{dom_block}"
         f"Test Case JSON:\n"
         f"```json\n{json.dumps(test_case_json, indent=2)}\n```\n\n"
         f"{extra_block}"
@@ -303,7 +335,8 @@ def _main_user_content(test_case_json: dict, user_instruction: str, framework_co
 
 
 def _build_anthropic_messages(
-    test_case_json: dict, user_instruction: str, framework_context: str
+    test_case_json: dict, user_instruction: str, framework_context: str,
+    dom_context: str = "",
 ) -> list[dict]:
     messages: list[dict] = []
     for shot in FEW_SHOTS:
@@ -327,13 +360,14 @@ def _build_anthropic_messages(
         )})
 
     messages.append({"role": "user", "content": _main_user_content(
-        test_case_json, user_instruction, framework_context
+        test_case_json, user_instruction, framework_context, dom_context
     )})
     return messages
 
 
 def _build_gemini_history(
-    test_case_json: dict, user_instruction: str, framework_context: str
+    test_case_json: dict, user_instruction: str, framework_context: str,
+    dom_context: str = "",
 ) -> tuple[list[dict], str]:
     """Returns (history_list, last_user_message) in Gemini format."""
     # Gemini uses "model" instead of "assistant"
@@ -357,7 +391,7 @@ def _build_gemini_history(
             f"maintaining all framework conventions."
         )]})
 
-    last_msg = _main_user_content(test_case_json, user_instruction, framework_context)
+    last_msg = _main_user_content(test_case_json, user_instruction, framework_context, dom_context)
     return history, last_msg
 
 
@@ -435,23 +469,25 @@ async def stream_script(
     user_instruction: str,
     framework_context: str,
     provider: LLMProvider | None = None,
+    dom_context: str = "",
 ) -> AsyncGenerator[str, None]:
     """
     Async generator — yields text chunks from the chosen LLM.
 
     `provider` overrides settings.LLM_PROVIDER for this call only.
     Falls back to settings.LLM_PROVIDER (set in .env) when None.
+    `dom_context` — optional live DOM context from page crawling.
     """
     active: LLMProvider = provider or settings.LLM_PROVIDER  # type: ignore[assignment]
-    logger.info("stream_script — provider=%s", active)
+    logger.info("stream_script — provider=%s, dom_context_len=%d", active, len(dom_context))
 
     if active == "gemini":
-        history, last = _build_gemini_history(test_case_json, user_instruction, framework_context)
+        history, last = _build_gemini_history(test_case_json, user_instruction, framework_context, dom_context)
         async for chunk in _stream_gemini(history, last):
             yield chunk
     else:
         # Default: Anthropic
-        messages = _build_anthropic_messages(test_case_json, user_instruction, framework_context)
+        messages = _build_anthropic_messages(test_case_json, user_instruction, framework_context, dom_context)
         async for chunk in _stream_anthropic(messages):
             yield chunk
 
@@ -484,3 +520,88 @@ def active_provider_info() -> dict:
             "configured": bool(settings.GEMINI_API_KEY),
         },
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# FIX MODE — Self-Healing (Auto-Fix Failed Scripts)
+# ════════════════════════════════════════════════════════════════════════════════
+
+FIX_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+
+=== FIX MODE ===
+You are now in FIX MODE. You are given a failing Playwright/TypeScript test
+and the Playwright error output from its execution.
+
+Your task:
+1. Analyze the error carefully (wrong selector? timeout? assertion mismatch?)
+2. Fix ONLY what is broken — preserve the test structure, steps, and logic
+3. If a selector is wrong, use a more robust alternative (prefer data-testid, getByRole, getByLabel)
+4. If a timeout occurred, add appropriate waitForSelector() calls
+5. If an assertion failed, check the expected value against what the error says
+6. Return ONLY the corrected TypeScript .spec.ts code — no explanations
+
+CRITICAL: The output must be a SINGLE valid TypeScript file starting with `import`.
+No markdown fences, no explanations before or after the code.
+"""
+
+
+async def stream_fix_script(
+    original_code: str,
+    error_message: str,
+    framework_context: str,
+    provider: LLMProvider | None = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Stream a fixed version of a failing test script.
+    Takes the original code + Playwright error output → yields corrected code chunks.
+    """
+    active: LLMProvider = provider or settings.LLM_PROVIDER  # type: ignore[assignment]
+    logger.info("stream_fix_script — provider=%s, error_len=%d", active, len(error_message))
+
+    user_message = (
+        f"Here is the ORIGINAL failing Playwright test:\n\n"
+        f"```typescript\n{original_code}\n```\n\n"
+        f"Framework context (existing Page Objects, fixtures, custom commands):\n"
+        f"```typescript\n{framework_context}\n```\n\n"
+        f"Here is the Playwright ERROR output from running this test:\n\n"
+        f"```\n{error_message}\n```\n\n"
+        f"Fix the test so it passes. Return ONLY the corrected TypeScript code."
+    )
+
+    if active == "gemini":
+        _ensure_gemini()
+        model = genai.GenerativeModel(
+            model_name=settings.GEMINI_MODEL,
+            system_instruction=FIX_SYSTEM_PROMPT,
+        )
+        chat = model.start_chat(history=[])
+        response = await chat.send_message_async(user_message, stream=True)
+        async for chunk in response:
+            if chunk.text:
+                yield chunk.text
+        try:
+            meta = response.usage_metadata
+            stream_fix_script.last_usage = {
+                "provider": "gemini", "model": settings.GEMINI_MODEL,
+                "input_tokens": meta.prompt_token_count or 0,
+                "output_tokens": meta.candidates_token_count or 0,
+            }
+        except Exception:
+            stream_fix_script.last_usage = {}
+    else:
+        messages = [{"role": "user", "content": user_message}]
+        async with _get_anthropic().messages.stream(
+            model=settings.ANTHROPIC_MODEL,
+            max_tokens=8000,
+            system=FIX_SYSTEM_PROMPT,
+            messages=messages,
+        ) as stream:
+            async for text in stream.text_stream:
+                yield text
+            final = await stream.get_final_message()
+            usage = final.usage
+            stream_fix_script.last_usage = {
+                "provider": "anthropic", "model": settings.ANTHROPIC_MODEL,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+            }

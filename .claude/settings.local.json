@@ -23,7 +23,8 @@
       "Bash(powershell -Command \"& ''C:\\\\Program Files\\\\Docker\\\\Docker\\\\resources\\\\bin\\\\docker.exe'' compose exec backend bash -c ''cd /workspace/mga/skye-e2e-tests && for f in tests/generated/*.spec.ts; do echo \"\"=== $f ===\"\"; head -3 \"\"$f\"\"; echo; done'' 2>&1\")",
       "Bash(powershell -Command \"& ''C:\\\\Program Files\\\\Docker\\\\Docker\\\\resources\\\\bin\\\\docker.exe'' compose up --build backend -d 2>&1 | Select-Object -Last 15\")",
       "Bash(curl -s http://localhost:5174/api/projects)",
-      "Bash(python -c \"import sys,json; [print\\(f''''{p[\"\"name\"\"]}: host={p[\"\"pw_host\"\"]}, user={p[\"\"pw_testuser\"\"]}, pass={\"\"***\"\" if p.get\\(\"\"pw_password\"\"\\) else \"\"EMPTY\"\"}, email={p[\"\"pw_email\"\"]}''''\\) for p in json.load\\(sys.stdin\\)]\")"
+      "Bash(python -c \"import sys,json; [print\\(f''''{p[\"\"name\"\"]}: host={p[\"\"pw_host\"\"]}, user={p[\"\"pw_testuser\"\"]}, pass={\"\"***\"\" if p.get\\(\"\"pw_password\"\"\\) else \"\"EMPTY\"\"}, email={p[\"\"pw_email\"\"]}''''\\) for p in json.load\\(sys.stdin\\)]\")",
+      "Bash(powershell -Command \"cd C:\\\\Users\\\\RajasekharUdumula\\\\Desktop\\\\AI_Automation_Code\\\\backend; .\\\\venv\\\\Scripts\\\\pip.exe install playwright 2>&1\")"
     ]
   }
 }

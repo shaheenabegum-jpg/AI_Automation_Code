@@ -154,6 +154,18 @@ export const fetchLLMProvider = async () => {
   return data;
 };
 
+// ── DOM Crawler ──────────────────────────────────────────────────────────────
+export const crawlPage = async (url: string) => {
+  const fd = new FormData();
+  fd.append('url', url);
+  const { data } = await api.post('/api/crawl-page', fd);
+  return data as {
+    url: string; title: string; screenshot_b64: string;
+    element_count: number;
+    elements_preview: Array<{ tag: string; selector: string; text: string }>;
+  };
+};
+
 // ── Script generation (SSE) ───────────────────────────────────────────────────
 export function createScriptStream(
   testCaseId: string,
@@ -163,12 +175,14 @@ export function createScriptStream(
   onError: (msg: string) => void,
   llmProvider: string = '',   // "anthropic" | "gemini" | "" (use server default)
   projectId: string = '',
+  pageUrl: string = '',       // optional: URL for DOM context crawling
 ): () => void {
   const fd = new FormData();
   fd.append('test_case_id', testCaseId);
   fd.append('user_instruction', userInstruction);
   fd.append('llm_provider', llmProvider);
   if (projectId) fd.append('project_id', projectId);
+  if (pageUrl) fd.append('page_url', pageUrl);
 
   let aborted = false;
   const controller = new AbortController();
@@ -216,138 +230,26 @@ export function createScriptStream(
   };
 }
 
-// ── Run logs (HTTP fallback — reads Redis history) ────────────────────────────
-export const fetchRunLogs = async (runId: string): Promise<string[]> => {
-  const { data } = await api.get(`/api/runs/${runId}/logs`);
-  return data.lines as string[];
-};
-
-// ── WebSocket — live logs ─────────────────────────────────────────────────────
-export function connectRunSocket(
+// ── Fix failed script (SSE) ──────────────────────────────────────────────────
+export function createFixStream(
   runId: string,
-  onLine: (line: string) => void,
-  onClose: () => void,
-): WebSocket {
-  // Use relative WS URL so Vite proxy forwards to ws://localhost:8000
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${proto}//${window.location.host}/ws/run/${runId}`);
-  ws.onmessage = (e) => onLine(e.data);
-  ws.onclose = onClose;
-  return ws;
-}
-
-
-// ══════════════════════════════════════════════════════════════════════════════
-// MCP Browser — AI Browser Tab API
-// ══════════════════════════════════════════════════════════════════════════════
-
-export const startMCPSession = async (config: MCPConfig) => {
-  const { data } = await api.post('/api/mcp/start-session', config);
-  return data as { session_id: string; status: string; browser: string; headless: boolean; url: string };
-};
-
-export const mcpAction = async (sessionId: string, action: string, params: Record<string, string> = {}) => {
-  const { data } = await api.post('/api/mcp/action', { session_id: sessionId, action, ...params });
-  return data;
-};
-
-export const mcpPause = async (sessionId: string) => {
-  const { data } = await api.post('/api/mcp/pause', { session_id: sessionId });
-  return data;
-};
-
-export const mcpResume = async (sessionId: string) => {
-  const { data } = await api.post('/api/mcp/resume', { session_id: sessionId });
-  return data;
-};
-
-export const stopMCPSession = async (sessionId: string) => {
-  const { data } = await api.post('/api/mcp/stop-session', { session_id: sessionId });
-  return data;
-};
-
-export const fetchMCPSessions = async (projectId?: string) => {
-  const params: Record<string, string> = {};
-  if (projectId) params.project_id = projectId;
-  const { data } = await api.get('/api/mcp/sessions', { params });
-  return data;
-};
-
-/** SSE stream for AI auto-exploration */
-export function mcpAutoExplore(
-  sessionId: string,
-  testCaseDescription: string,
-  url: string,
-  onEvent: (event: MCPEvent) => void,
-  onDone: () => void,
-  onError: (msg: string) => void,
-  llmProvider: string = '',
-  projectId: string = '',
-): () => void {
-  let aborted = false;
-  const controller = new AbortController();
-
-  fetch(`${BASE_URL}/api/mcp/auto-explore`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      session_id: sessionId,
-      test_case_description: testCaseDescription,
-      url,
-      llm_provider: llmProvider,
-      project_id: projectId,
-    }),
-    signal: controller.signal,
-  })
-    .then(async (res) => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done || aborted) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const payload = JSON.parse(line.slice(6)) as MCPEvent;
-            onEvent(payload);
-            if (payload.type === 'done') onDone();
-          } catch { /* ignore */ }
-        }
-      }
-    })
-    .catch((e) => { if (!aborted) onError(String(e)); });
-
-  return () => { aborted = true; controller.abort(); };
-}
-
-/** SSE stream for script generation from MCP exploration */
-export function mcpGenerateScript(
-  sessionId: string,
-  testCaseDescription: string,
   onChunk: (text: string) => void,
-  onDone: (scriptId: string, isValid: boolean, errors: string) => void,
+  onDone: (scriptId: string, isValid: boolean, errors: string, filePath: string) => void,
   onError: (msg: string) => void,
   llmProvider: string = '',
   projectId: string = '',
 ): () => void {
+  const fd = new FormData();
+  fd.append('run_id', runId);
+  fd.append('llm_provider', llmProvider);
+  if (projectId) fd.append('project_id', projectId);
+
   let aborted = false;
   const controller = new AbortController();
 
-  fetch(`${BASE_URL}/api/mcp/generate-script`, {
+  fetch(`${BASE_URL}/api/fix-script`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      session_id: sessionId,
-      test_case_description: testCaseDescription,
-      llm_provider: llmProvider,
-      project_id: projectId,
-    }),
+    body: fd,
     signal: controller.signal,
   })
     .then(async (res) => {
@@ -367,28 +269,39 @@ export function mcpGenerateScript(
           try {
             const payload = JSON.parse(line.slice(6));
             if (payload.type === 'chunk') onChunk(payload.text);
-            else if (payload.type === 'done') onDone(payload.script_id, payload.valid, payload.errors ?? '');
+            else if (payload.type === 'done')
+              onDone(payload.script_id, payload.valid, payload.errors ?? '', payload.file_path ?? '');
             else if (payload.type === 'error') onError(payload.message);
-          } catch { /* ignore */ }
+          } catch { /* ignore parse errors */ }
         }
       }
     })
-    .catch((e) => { if (!aborted) onError(String(e)); });
+    .catch((e) => {
+      if (!aborted) onError(String(e));
+    });
 
-  return () => { aborted = true; controller.abort(); };
+  return () => {
+    aborted = true;
+    controller.abort();
+  };
 }
 
-/** WebSocket for live MCP events */
-export function connectMCPSocket(
-  sessionId: string,
-  onEvent: (event: MCPEvent) => void,
+// ── Run logs (HTTP fallback — reads Redis history) ────────────────────────────
+export const fetchRunLogs = async (runId: string): Promise<string[]> => {
+  const { data } = await api.get(`/api/runs/${runId}/logs`);
+  return data.lines as string[];
+};
+
+// ── WebSocket — live logs ─────────────────────────────────────────────────────
+export function connectRunSocket(
+  runId: string,
+  onLine: (line: string) => void,
   onClose: () => void,
 ): WebSocket {
+  // Use relative WS URL so Vite proxy forwards to ws://localhost:8000
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${proto}//${window.location.host}/ws/mcp/${sessionId}`);
-  ws.onmessage = (e) => {
-    try { onEvent(JSON.parse(e.data)); } catch { /* ignore */ }
-  };
+  const ws = new WebSocket(`${proto}//${window.location.host}/ws/run/${runId}`);
+  ws.onmessage = (e) => onLine(e.data);
   ws.onclose = onClose;
   return ws;
 }

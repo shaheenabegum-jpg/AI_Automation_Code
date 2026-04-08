@@ -4,7 +4,7 @@
 import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
 import {
   Card, Select, Button, Tag, Space,
-  Badge, Typography, Table, Tooltip, Spin, Empty, Popconfirm, message,
+  Badge, Typography, Table, Tooltip, Spin, Empty, Popconfirm, message, Drawer,
 } from 'antd';
 import {
   PlayCircleOutlined, StopOutlined, LinkOutlined,
@@ -15,7 +15,8 @@ import {
 } from '@ant-design/icons';
 import toast from 'react-hot-toast';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { fetchSpecFiles, fetchRuns, runSpec, connectRunSocket, fetchRunLogs, deleteRun, cancelRun, clearAllRuns } from '../api/client';
+import { fetchSpecFiles, fetchRuns, runSpec, connectRunSocket, fetchRunLogs, deleteRun, cancelRun, clearAllRuns, createFixStream } from '../api/client';
+import Editor from '@monaco-editor/react';
 import { useProjectContext } from '../context/ProjectContext';
 import type { ExecutionRun, RunParams, SpecFile } from '../types';
 import { colors, STATUS_COLORS } from '../theme';
@@ -77,6 +78,16 @@ export default function RunTab() {
   const wsRef        = useRef<WebSocket | null>(null);
   const pollRef      = useRef<ReturnType<typeof setInterval> | null>(null);
   const wsLogsRef    = useRef<number>(0);
+
+  // Auto-Fix state
+  const [fixDrawerOpen, setFixDrawerOpen] = useState(false);
+  const [fixingRunId, setFixingRunId]     = useState<string | null>(null);
+  const [fixCode, setFixCode]             = useState('');
+  const [fixResult, setFixResult]         = useState<{
+    scriptId: string; isValid: boolean; errors: string; filePath: string;
+  } | null>(null);
+  const [fixAttempts, setFixAttempts]     = useState<Record<string, number>>({});
+  const stopFixRef = useRef<(() => void) | null>(null);
 
   // ── Resizable splitter between Live Logs and Execution History ──────────────
   const [splitPct, setSplitPct]  = useState(55);          // % of right panel for logs
@@ -271,6 +282,34 @@ export default function RunTab() {
     }
   };
 
+  const handleAutoFix = useCallback((runId: string) => {
+    const attempts = fixAttempts[runId] || 0;
+    if (attempts >= 2) {
+      toast.error('Max 2 auto-fix attempts reached for this run');
+      return;
+    }
+    setFixingRunId(runId);
+    setFixCode('');
+    setFixResult(null);
+    setFixDrawerOpen(true);
+
+    let code = '';
+    const stop = createFixStream(
+      runId,
+      (chunk) => { code += chunk; setFixCode(code); },
+      (scriptId, isValid, errors, filePath) => {
+        setFixResult({ scriptId, isValid, errors, filePath });
+        setFixAttempts((prev) => ({ ...prev, [runId]: (prev[runId] || 0) + 1 }));
+        if (isValid) toast.success('Fix generated and validated!');
+        else toast.error('Fix generated but has validation errors');
+      },
+      (msg) => { toast.error(`Fix failed: ${msg}`); },
+      '', // use default provider
+      selectedProjectId ?? '',
+    );
+    stopFixRef.current = stop;
+  }, [fixAttempts, selectedProjectId]);
+
   const handleSpecSelect = (value: string) => {
     const spec = specFiles.find((s) => `${s.path}|||${s.branch}` === value);
     setSelectedSpec(spec ?? null);
@@ -342,9 +381,20 @@ export default function RunTab() {
         ) : <Text style={{ color: colors.textMuted }}>—</Text>,
     },
     {
-      title: 'Actions', width: 80, fixed: 'right' as const,
+      title: 'Actions', width: 120, fixed: 'right' as const,
       render: (_: unknown, r: ExecutionRun) => (
         <Space size={4}>
+          {r.status === 'failed' && (fixAttempts[r.id] || 0) < 2 && (
+            <Tooltip title="Auto-Fix with AI">
+              <Button
+                size="small"
+                icon={<ThunderboltOutlined />}
+                onClick={() => handleAutoFix(r.id)}
+                loading={fixingRunId === r.id}
+                style={{ borderColor: '#f59e0b', color: '#f59e0b' }}
+              />
+            </Tooltip>
+          )}
           {(r.status === 'queued' || r.status === 'running') && (
             <Popconfirm
               title="Cancel this run?"
@@ -725,6 +775,81 @@ export default function RunTab() {
           </Card>
         </div>
       </div>
+
+      {/* Auto-Fix Drawer */}
+      <Drawer
+        title={
+          <Space>
+            <ThunderboltOutlined style={{ color: '#f59e0b' }} />
+            <span>Auto-Fix Failed Test</span>
+            {fixResult && (
+              <Tag color={fixResult.isValid ? 'green' : 'red'}>
+                {fixResult.isValid ? 'Valid' : 'Invalid'}
+              </Tag>
+            )}
+          </Space>
+        }
+        placement="right"
+        width={680}
+        open={fixDrawerOpen}
+        onClose={() => {
+          setFixDrawerOpen(false);
+          stopFixRef.current?.();
+          setFixingRunId(null);
+        }}
+        styles={{ body: { padding: 0, display: 'flex', flexDirection: 'column', height: '100%' } }}
+      >
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <Editor
+            height="100%"
+            language="typescript"
+            theme="vs-dark"
+            value={fixCode}
+            options={{ readOnly: true, minimap: { enabled: false }, fontSize: 12, wordWrap: 'on' }}
+          />
+        </div>
+        {fixResult && (
+          <div style={{
+            padding: '12px 16px', borderTop: `1px solid ${colors.border}`,
+            background: colors.bgCard, display: 'flex', gap: 10, alignItems: 'center',
+          }}>
+            {fixResult.isValid ? (
+              <Tag color="green" style={{ margin: 0 }}>✓ TypeScript Valid</Tag>
+            ) : (
+              <Tooltip title={fixResult.errors}>
+                <Tag color="red" style={{ margin: 0, cursor: 'help' }}>✗ Validation Errors</Tag>
+              </Tooltip>
+            )}
+            {fixResult.filePath && (
+              <Text style={{ color: colors.textMuted, fontSize: 11 }}>
+                Saved: {fixResult.filePath}
+              </Text>
+            )}
+            <span style={{ flex: 1 }} />
+            {fixResult.isValid && fixResult.filePath && (
+              <Button
+                type="primary"
+                size="small"
+                icon={<PlayCircleOutlined />}
+                onClick={() => {
+                  setFixDrawerOpen(false);
+                  toast.success('Re-run the fixed spec from the spec file dropdown');
+                }}
+              >
+                Close & Re-Run
+              </Button>
+            )}
+          </div>
+        )}
+        {!fixResult && fixCode && (
+          <div style={{ padding: '8px 16px', background: colors.bgCard, borderTop: `1px solid ${colors.border}` }}>
+            <Space>
+              <LoadingOutlined style={{ color: colors.primary }} />
+              <Text style={{ color: colors.textSecondary, fontSize: 12 }}>Generating fix…</Text>
+            </Space>
+          </div>
+        )}
+      </Drawer>
     </div>
   );
 }

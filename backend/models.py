@@ -166,45 +166,6 @@ class ExecutionRun(Base):
     script: Mapped[Optional["GeneratedScript"]] = relationship(back_populates="runs")
 
 
-# ── MCP Browser Sessions ─────────────────────────────────────────────────────────
-class MCPSessionStatus(str, enum.Enum):
-    active = "active"
-    paused = "paused"
-    completed = "completed"
-    error = "error"
-
-
-class MCPBrowserSession(Base):
-    __tablename__ = "mcp_browser_sessions"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    project_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("projects.id"), nullable=True, index=True
-    )
-    test_case_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("test_cases.id"), nullable=True
-    )
-    start_url: Mapped[str] = mapped_column(String(500), nullable=False)
-    browser: Mapped[str] = mapped_column(String(20), default="chromium")
-    headless: Mapped[bool] = mapped_column(Boolean, default=True)
-    status: Mapped[MCPSessionStatus] = mapped_column(
-        SAEnum(MCPSessionStatus), default=MCPSessionStatus.active
-    )
-    steps: Mapped[Optional[dict]] = mapped_column(JSON)  # array of action steps
-    generated_script_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("generated_scripts.id"), nullable=True
-    )
-    total_steps: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-
-    project: Mapped[Optional["Project"]] = relationship()
-    test_case: Mapped[Optional["TestCase"]] = relationship()
-    generated_script: Mapped[Optional["GeneratedScript"]] = relationship()
-
-
 # ── Prompt Audit ─────────────────────────────────────────────────────────────────
 class UserPrompt(Base):
     __tablename__ = "user_prompts"
@@ -223,3 +184,27 @@ class UserPrompt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     script: Mapped["GeneratedScript"] = relationship(back_populates="prompts")
+
+
+# ── DOM Snapshots ──────────────────────────────────────────────────────────────
+class DomSnapshot(Base):
+    __tablename__ = "dom_snapshots"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    project_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id"), nullable=True, index=True
+    )
+    url: Mapped[str] = mapped_column(String(2000), nullable=False, index=True)
+    url_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)  # sha256
+    title: Mapped[Optional[str]] = mapped_column(String(500))
+    element_count: Mapped[int] = mapped_column(Integer, default=0)
+    elements: Mapped[Optional[dict]] = mapped_column(JSON)            # full elements array
+    accessibility_tree: Mapped[Optional[str]] = mapped_column(Text)   # JSON string (capped 8K)
+    screenshot_b64: Mapped[Optional[str]] = mapped_column(Text)       # JPEG base64
+    dom_context: Mapped[Optional[str]] = mapped_column(Text)          # chunked LLM context
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    project: Mapped[Optional["Project"]] = relationship()
