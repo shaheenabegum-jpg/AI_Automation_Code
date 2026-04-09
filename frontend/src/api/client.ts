@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { Project, MCPConfig, MCPStep, MCPEvent } from '../types';
+import type { Project } from '../types';
 
 // Use relative URLs so requests go through the Vite dev proxy → avoids CORS entirely.
 // Vite config: '/api' proxied to http://localhost:8000, '/ws' proxied to ws://localhost:8000
