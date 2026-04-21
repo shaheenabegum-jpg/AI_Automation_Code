@@ -420,9 +420,12 @@ async def run_test_via_github_actions(
             await pub(f"✓ Using workflow: '{workflow_name}' (id={workflow_id})")
 
             # 4. Trigger workflow_dispatch
+            # Strip skye-e2e-tests/ prefix — workflow working-directory is already skye-e2e-tests/
+            test_file_rel = file_repo_path.removeprefix("skye-e2e-tests/")
             triggered_at = time.time()
             inputs = {
-                "test_file":      file_repo_path,
+                "test_file":      test_file_rel,
+                "branch":         AI_TESTS_BRANCH,
                 "browser":        browser,
                 "environment":    environment,
                 "execution_mode": execution_mode,

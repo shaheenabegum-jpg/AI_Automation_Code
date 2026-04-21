@@ -178,11 +178,11 @@ def _format_element(el: dict) -> str:
     if selector:
         parts.append(f"selector='{selector}'")
 
-    text = el.get("text", "").strip()
+    text = (el.get("text") or "").strip()
     if text:
         parts.append(f'text="{text[:50]}"')
 
-    placeholder = el.get("placeholder", "")
+    placeholder = (el.get("placeholder") or "")
     if placeholder:
         parts.append(f'placeholder="{placeholder[:40]}"')
 

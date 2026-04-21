@@ -23,7 +23,7 @@ from typing import Optional
 
 from fastapi import (
     FastAPI, File, Form, UploadFile, WebSocket,
-    WebSocketDisconnect, Depends, HTTPException, Query, Body
+    WebSocketDisconnect, Depends, HTTPException, Query, Body, Request
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
@@ -223,6 +223,67 @@ async def crawl_page_endpoint(
         "element_count": result.get("element_count", 0),
         "elements_preview": result.get("elements", [])[:20],
         "login_status": result.get("login_status"),
+    }
+
+
+@app.post("/api/import-snapshot")
+async def import_snapshot_endpoint(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Accept a pre-crawled DOM snapshot (captured externally, e.g. via Chrome on VPN)
+    and store it in the database exactly like /api/crawl-page would."""
+    import hashlib as _hl
+    from dom_chunker import build_dom_context
+
+    body = await request.json()
+    url        = body.get("url", "").strip()
+    project_id = body.get("project_id", "").strip()
+    title      = body.get("title", "")
+    elements   = body.get("elements", [])
+    screenshot = body.get("screenshot_b64", "")
+    a11y_tree  = body.get("accessibility_tree", "")
+
+    if not url:
+        raise HTTPException(400, "url is required")
+
+    url_hash = _hl.sha256(url.encode()).hexdigest()
+
+    # Build chunked LLM context from elements
+    raw_result = {
+        "url": url,
+        "title": title,
+        "elements": elements,
+        "accessibility_tree": a11y_tree,
+        "screenshot_b64": screenshot,
+    }
+    dom_ctx = build_dom_context(raw_result)
+
+    from models import DomSnapshot
+    snap = DomSnapshot(
+        url=url,
+        url_hash=url_hash,
+        title=title,
+        element_count=len(elements),
+        elements=elements,
+        accessibility_tree=a11y_tree[:8000] if a11y_tree else None,
+        screenshot_b64=screenshot or None,
+        dom_context=dom_ctx or None,
+        project_id=uuid.UUID(project_id) if project_id else None,
+    )
+    db.add(snap)
+    await db.commit()
+    await db.refresh(snap)
+
+    snapshot_id = str(snap.id)
+    logger.info("Imported snapshot %s for %s (%d elements)", snapshot_id, url, len(elements))
+    return {
+        "snapshot_id": snapshot_id,
+        "url": url,
+        "title": title,
+        "element_count": len(elements),
+        "dom_context_length": len(dom_ctx),
+        "screenshot_captured": bool(screenshot),
     }
 
 
